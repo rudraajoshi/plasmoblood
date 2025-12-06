@@ -32,6 +32,8 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Email, To, Content
 import os
 from dotenv import load_dotenv
+import requests
+import urllib.parse
 # Allow HTTP for local OAuth testing (never do this in production)
 # os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 if os.environ.get("FLASK_ENV") == "development":
@@ -54,7 +56,7 @@ db = firestore.client()
 print("✅ Firebase and Firestore initialized successfully")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "plasmo_secret_key_change_in_production")  # consider moving to env var
-
+FAST2SMS_API_KEY = os.environ.get("FAST2SMS_API_KEY")
 # Session cookie settings (good defaults for localhost)
 app.config.update(
     SESSION_COOKIE_SECURE=True,         # Required for HTTPS (Render)
@@ -88,6 +90,11 @@ EMAIL_ADDRESS = "neelchothani9417@gmail.com"      # Replace with your sender ema
 EMAIL_PASSWORD = "kfkq gibg zsis xfao"
 # Comma-separated admin email overrides, e.g. "admin@plasmo.com,owner@acme.com"
 ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "admin@plasmo.com").split(",") if e.strip()}
+
+if FAST2SMS_API_KEY:
+    print("✅ Fast2SMS configured successfully")
+else:
+    print("⚠️ FAST2SMS_API_KEY not configured - SMS disabled")
 
 oauth = OAuth(app)
 oauth.register(
@@ -525,92 +532,380 @@ def send_email_threaded(to_email, subject, html_body):
     thread.start()
     print(f"📤 Email queued for {to_email}")
 
+def send_sms_fast2sms_blocking(phone_numbers, message):
+    """
+    Send SMS using Fast2SMS Quick Transactional Route (NO verification needed!)
+    Works immediately after recharge - delivers to inbox
+    
+    Args:
+        phone_numbers: String or list of phone numbers (without +91)
+        message: SMS text (max 500 characters)
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not FAST2SMS_API_KEY:
+        print("⚠️ Fast2SMS not configured - SMS skipped")
+        return False
+    
+    try:
+        # === STEP 1: Clean phone numbers ===
+        if isinstance(phone_numbers, list):
+            cleaned_phones = []
+            for p in phone_numbers:
+                phone_str = str(p).strip()
+                if phone_str.startswith('+91'):
+                    phone_str = phone_str[3:]
+                elif phone_str.startswith('91') and len(phone_str) == 12:
+                    phone_str = phone_str[2:]
+                if phone_str.startswith('0'):
+                    phone_str = phone_str[1:]
+                phone_str = ''.join(filter(str.isdigit, phone_str))
+                if phone_str:
+                    cleaned_phones.append(phone_str)
+            phone_numbers = ",".join(cleaned_phones)
+        else:
+            phone_str = str(phone_numbers).strip()
+            if phone_str.startswith('+91'):
+                phone_str = phone_str[3:]
+            elif phone_str.startswith('91') and len(phone_str) == 12:
+                phone_str = phone_str[2:]
+            if phone_str.startswith('0'):
+                phone_str = phone_str[1:]
+            phone_numbers = ''.join(filter(str.isdigit, phone_str))
+        
+        # Validate
+        for phone in phone_numbers.split(','):
+            if not phone.isdigit() or len(phone) != 10:
+                print(f"❌ Invalid phone: {phone}")
+                return False
+        
+        print(f"📱 Sending SMS to {phone_numbers} via Fast2SMS (Quick Transactional)")
+        
+        # === STEP 2: Use Quick Transactional Route ===
+        url = "https://www.fast2sms.com/dev/bulkV2"
+        
+        # ✅ QUICK TRANSACTIONAL - No verification needed!
+        payload = {
+            "message": message[:500],  # Use 'message' not 'variables_values'
+            "route": "q",  # 'q' = Quick Transactional route
+            "language": "english",
+            "flash": 0,  # 0 = normal SMS, 1 = flash SMS
+            "numbers": phone_numbers
+        }
+        
+        headers = {
+            "authorization": FAST2SMS_API_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        print(f"📤 Request: {payload}")
+        
+        # === STEP 3: Send ===
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        
+        print(f"📊 HTTP {response.status_code}: {response.text}")
+        
+        # === STEP 4: Check response ===
+        try:
+            response_data = response.json()
+        except:
+            print(f"❌ Invalid JSON: {response.text}")
+            return False
+        
+        # === STEP 5: Success check ===
+        if response.status_code == 200 and response_data.get("return"):
+            print(f"✅ SMS sent to {phone_numbers}")
+            print(f"   Message ID: {response_data.get('request_id')}")
+            return True
+        else:
+            error_msg = response_data.get('message', 'Unknown error')
+            print(f"❌ Fast2SMS Error: {error_msg}")
+            
+            # Helpful error messages
+            if "authorization" in error_msg.lower():
+                print("⚠️ Invalid API key - check FAST2SMS_API_KEY")
+            elif "balance" in error_msg.lower():
+                print("⚠️ Insufficient balance - recharge at https://www.fast2sms.com/dashboard")
+            elif "route" in error_msg.lower():
+                print("⚠️ Quick Transactional route issue")
+                print("   → Try switching to 'dlt' route (requires DLT registration)")
+            
+            return False
+            
+    except requests.exceptions.Timeout:
+        print(f"❌ Fast2SMS timeout")
+        return False
+    except Exception as e:
+        print(f"❌ Fast2SMS error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def send_sms_fast2sms_threaded(phone_numbers, message):
+    """
+    Send Fast2SMS in background thread (non-blocking)
+    
+    Use this in web routes to prevent timeout
+    """
+    def _send():
+        try:
+            success = send_sms_fast2sms_blocking(phone_numbers, message)
+            if success:
+                print(f"✅ SMS thread completed for {phone_numbers}")
+            else:
+                print(f"⚠️ SMS thread failed for {phone_numbers}")
+        except Exception as e:
+            print(f"❌ SMS thread exception: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    # Non-daemon thread ensures completion
+    thread = threading.Thread(target=_send, daemon=False)
+    thread.start()
+    print(f"📤 SMS queued for {phone_numbers}")
+
+
 def _send_donor_request_email(request_id, donor, patient_name, blood_group, details, phone):
     """
-    Send donor request email using SendGrid (non-blocking)
+    Send donor request via EMAIL + SMS
+    OPTIMIZED: Message format to avoid spam filters
     """
     donor_email = donor.get("email")
+    donor_phone = donor.get("phone")
     donor_id = donor.get("id")
     distance_km = donor.get("distance", 0)
     
-    if not donor_email:
-        print(f"⚠️ Donor {donor.get('name')} has no email, skipping")
-        return
-
-    # Build accept/reject links
+    # Build response links
     accept_link = f"{request.url_root}donor_response/{request_id}/{donor_id}/accept"
     reject_link = f"{request.url_root}donor_response/{request_id}/{donor_id}/reject"
+    
+    # === 1. SEND EMAIL (unchanged) ===
+    if donor_email:
+        html = f"""
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                           color: white; padding: 20px; border-radius: 8px 8px 0 0; text-align: center; }}
+                .content {{ background: #f9f9f9; padding: 20px; border: 1px solid #ddd; }}
+                .info-box {{ background: white; padding: 15px; margin: 10px 0; 
+                            border-left: 4px solid #667eea; border-radius: 4px; }}
+                .info-label {{ font-weight: bold; color: #667eea; display: inline-block; 
+                              min-width: 120px; }}
+                .action-buttons {{ display: flex; gap: 10px; margin-top: 20px; 
+                                justify-content: center; flex-wrap: wrap; }}
+                .btn {{ display: inline-block; padding: 12px 24px; border-radius: 6px; 
+                       text-decoration: none; font-weight: bold; font-size: 16px; 
+                       border: none; cursor: pointer; text-align: center; min-width: 140px; }}
+                .btn-accept {{ background: #28a745; color: white; }}
+                .btn-reject {{ background: #dc3545; color: white; }}
+                .footer {{ background: #f0f0f0; padding: 15px; text-align: center; 
+                          font-size: 12px; color: #666; border-radius: 0 0 8px 8px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h2 style="margin: 0;">🩸 Blood Request</h2>
+                </div>
+                
+                <div class="content">
+                    <p>Hi <strong>{donor.get('name', 'Donor')}</strong>,</p>
+                    
+                    <p>A patient near you needs blood. Can you help?</p>
+                    
+                    <div class="info-box">
+                        <div><span class="info-label">Patient:</span> {patient_name}</div>
+                        <div><span class="info-label">Blood Group:</span> {blood_group}</div>
+                        <div><span class="info-label">Distance:</span> {distance_km:.1f} km away</div>
+                        <div><span class="info-label">Contact:</span> {phone or 'N/A'}</div>
+                        {f'<div><span class="info-label">Details:</span> {details}</div>' if details else ''}
+                    </div>
+                    
+                    <div class="action-buttons">
+                        <a href="{accept_link}" class="btn btn-accept">Accept</a>
+                        <a href="{reject_link}" class="btn btn-reject">Decline</a>
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <p>© PlasmoBlood Sync</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        send_email_threaded(
+            to_email=donor_email,
+            subject=f"Blood Request - {blood_group} Needed",
+            html_body=html
+        )
+        print(f"📧 Email queued for {donor.get('name')} ({distance_km:.1f}km)")
+    
+    # === 2. SEND SMS (OPTIMIZED MESSAGE) ===
+    if donor_phone:
+        phone_str = str(donor_phone).strip()
+        
+        # Clean phone number
+        if phone_str.startswith('+91'):
+            phone_str = phone_str[3:]
+        elif phone_str.startswith('91') and len(phone_str) == 12:
+            phone_str = phone_str[2:]
+        if phone_str.startswith('0'):
+            phone_str = phone_str[1:]
+        
+        clean_phone = ''.join(filter(str.isdigit, phone_str))
+        
+        if len(clean_phone) == 10 and clean_phone.isdigit():
+            # ✅ NEW: Use standalone response page
+            response_page = f"{request.url_root}respond/{request_id}/{donor_id}"
+            
+            # Remove protocol to avoid spam filters
+            clean_url = response_page.replace("https://", "").replace("http://", "")
+            
+            # Simple, clean message
+            sms_body = f"Blood needed: {patient_name} ({blood_group}). Respond at {clean_url}"
+            
+            if len(sms_body) > 140:
+                sms_body = f"{patient_name} needs {blood_group}. Reply: {clean_url}"
+            
+            print(f"📱 SMS ({len(sms_body)} chars): {sms_body}")
+            print(f"📱 Sending to {donor.get('name')} at {clean_phone}...")
+            
+            success = send_sms_fast2sms_blocking(clean_phone, sms_body)
+            
+            if success:
+                print(f"✅ SMS sent to {donor.get('name')} ({distance_km:.1f}km)")
+            else:
+                print(f"❌ SMS failed for {donor.get('name')}")
+        else:
+            print(f"⚠️ Invalid phone: '{donor_phone}' → '{clean_phone}'")
+    else:
+        print(f"⚠️ No phone for {donor.get('name')}")
 
-    html = f"""
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <style>
-            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-            .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                       color: white; padding: 20px; border-radius: 8px 8px 0 0; text-align: center; }}
-            .content {{ background: #f9f9f9; padding: 20px; border: 1px solid #ddd; }}
-            .info-box {{ background: white; padding: 15px; margin: 10px 0; 
-                        border-left: 4px solid #667eea; border-radius: 4px; }}
-            .info-label {{ font-weight: bold; color: #667eea; display: inline-block; 
-                          min-width: 120px; }}
-            .action-buttons {{ display: flex; gap: 10px; margin-top: 20px; 
-                            justify-content: center; flex-wrap: wrap; }}
-            .btn {{ display: inline-block; padding: 12px 24px; border-radius: 6px; 
-                   text-decoration: none; font-weight: bold; font-size: 16px; 
-                   border: none; cursor: pointer; text-align: center; min-width: 140px; }}
-            .btn-accept {{ background: #28a745; color: white; }}
-            .btn-reject {{ background: #dc3545; color: white; }}
-            .btn:hover {{ opacity: 0.9; }}
-            .distance {{ color: #666; font-size: 14px; margin-top: 5px; }}
-            .footer {{ background: #f0f0f0; padding: 15px; text-align: center; 
-                      font-size: 12px; color: #666; border-radius: 0 0 8px 8px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h2 style="margin: 0;">🩸 Blood/Plasma Request</h2>
-            </div>
-            
-            <div class="content">
-                <p>Hi <strong>{donor.get('name', 'Donor')}</strong>,</p>
-                
-                <p>A patient near you needs blood/plasma urgently. Can you help?</p>
-                
-                <div class="info-box">
-                    <div><span class="info-label">Patient:</span> {patient_name}</div>
-                    <div><span class="info-label">Blood Group:</span> {blood_group}</div>
-                    <div><span class="info-label">Distance:</span> {distance_km:.1f} km away</div>
-                    <div><span class="info-label">Contact:</span> {phone or 'N/A'}</div>
-                    {f'<div><span class="info-label">Details:</span> {details}</div>' if details else ''}
-                </div>
-                
-                <div class="action-buttons">
-                    <a href="{accept_link}" class="btn btn-accept">✅ Accept Request</a>
-                    <a href="{reject_link}" class="btn btn-reject">❌ Reject Request</a>
-                </div>
-                
-                <p style="margin-top: 20px; font-size: 14px; color: #666;">
-                    ⏰ Please respond quickly. Other donors may also be notified.
-                </p>
-            </div>
-            
-            <div class="footer">
-                <p>© PlasmoBlood Sync - Saving lives, one donation at a time</p>
-            </div>
-        </div>
-    </body>
-    </html>
+
+# === TEST ROUTE ===
+@app.route("/test-sms-inbox")
+def test_sms_inbox():
+    """Test SMS with inbox-optimized message"""
+    if session.get("role") != "admin" and not app.debug:
+        return "Unauthorized", 403
+    
+    test_phone = "8850134584"  # Replace with your number
+    
+    # Clean, simple message (no spam triggers)
+    test_message = "Blood donation request from PlasmoBlood. Patient needs help. Reply to assist."
+    
+    print("=" * 50)
+    print("🧪 TESTING SMS (Promotional Route - Inbox Delivery)")
+    print("=" * 50)
+    print(f"Message length: {len(test_message)} chars")
+    print(f"Message: {test_message}")
+    
+    success = send_sms_fast2sms_blocking(test_phone, test_message)
+    
+    if success:
+        return f"""
+        <html>
+        <head><title>SMS Test</title></head>
+        <body style="font-family: Arial; padding: 20px;">
+            <h2 style="color: green;">✅ SMS Sent Successfully!</h2>
+            <p><strong>Check your phone's MAIN INBOX (not spam)</strong></p>
+            <p>Message sent: "{test_message}"</p>
+            <hr>
+            <h3>If still going to spam, try these:</h3>
+            <ol>
+                <li><strong>Whitelist Fast2SMS:</strong> Save sender to contacts</li>
+                <li><strong>Report as "Not Spam":</strong> Mark one SMS as not spam</li>
+                <li><strong>Shorten message:</strong> Keep under 100 characters</li>
+                <li><strong>Remove URLs:</strong> Use phone numbers instead of links</li>
+            </ol>
+            <a href="/dashboard" style="display: inline-block; margin-top: 20px; 
+               padding: 10px 20px; background: #667eea; color: white; 
+               text-decoration: none; border-radius: 5px;">Back to Dashboard</a>
+        </body>
+        </html>
+        """
+    else:
+        return f"""
+        <html>
+        <head><title>SMS Test Failed</title></head>
+        <body style="font-family: Arial; padding: 20px;">
+            <h2 style="color: red;">❌ SMS Failed</h2>
+            <p>Check console logs for error details</p>
+            <h3>Common issues:</h3>
+            <ul>
+                <li>Invalid API key (check FAST2SMS_API_KEY in .env)</li>
+                <li>Insufficient balance (need ₹20 minimum)</li>
+                <li>Account not activated</li>
+            </ul>
+            <a href="/dashboard" style="display: inline-block; margin-top: 20px; 
+               padding: 10px 20px; background: #dc3545; color: white; 
+               text-decoration: none; border-radius: 5px;">Back to Dashboard</a>
+        </body>
+        </html>
+        """
+
+def clean_phone_for_fast2sms(phone):
     """
+    Convert phone to Fast2SMS format (10 digits, no +91)
+    
+    Examples:
+        +919876543210 → 9876543210
+        919876543210 → 9876543210
+        9876543210 → 9876543210
+    """
+    if not phone:
+        return None
+    
+    # Remove all non-digits
+    phone = re.sub(r'\D', '', str(phone))
+    
+    # Remove country code if present
+    if phone.startswith('91') and len(phone) == 12:
+        phone = phone[2:]
+    
+    # Validate
+    if len(phone) == 10 and phone.isdigit():
+        return phone
+    
+    return None
 
-    send_email_threaded(
-        to_email=donor_email,
-        subject=f"🩸 Urgent: Blood/Plasma Request - {blood_group} Needed",
-        html_body=html
-    )
-    print(f"📧 Request notification sent to {donor.get('name')} ({distance_km:.1f}km)")
+
+def send_bulk_sms_fast2sms(donors, message):
+    """
+    Send same SMS to multiple donors at once (more efficient)
+    
+    Args:
+        donors: List of donor dicts with 'phone' key
+        message: SMS text
+    """
+    # Extract and clean phone numbers
+    phone_list = []
+    for donor in donors:
+        clean_phone = clean_phone_for_fast2sms(donor.get('phone'))
+        if clean_phone:
+            phone_list.append(clean_phone)
+    
+    if not phone_list:
+        print("⚠️ No valid phone numbers to send SMS")
+        return False
+    
+    # Fast2SMS supports comma-separated numbers (up to 50 per request)
+    # Split into batches if more than 50
+    batch_size = 50
+    for i in range(0, len(phone_list), batch_size):
+        batch = phone_list[i:i+batch_size]
+        # ✅ Use blocking call for bulk SMS too
+        send_sms_fast2sms_blocking(batch, message)
+    
+    return True
 # =========================================
 # ---------------- ROUTES -----------------
 # =========================================
@@ -1040,26 +1335,26 @@ def signup():
 
 @app.route("/google_login")
 def google_login():
-    # Get role from dropdown query param (default user)
+    # Get role and phone from query params
     role = request.args.get("role", "user")
+    phone = request.args.get("phone", "")  # ← NEW: Get phone number
     
-    # Convert donor to user (as per your new rule)
+    # Convert donor to user
     if role.lower() == "donor":
         role = "user"
 
     # Store temporarily for callback
     session["pending_role"] = role
-    session.permanent = True  # Make session persistent
+    session["pending_phone"] = phone  # ← NEW: Store phone in session
+    session.permanent = True
 
-    # CRITICAL FIX: Force HTTPS scheme for production
-    # Detect if we're on Render (or any production HTTPS environment)
+    # Force HTTPS scheme for production
     if request.headers.get('X-Forwarded-Proto') == 'https' or request.url.startswith('https://'):
         redirect_uri = url_for("google_callback", _external=True, _scheme='https')
     else:
-        # Local development fallback
         redirect_uri = url_for("google_callback", _external=True)
     
-    print(f"[OAuth] Redirect URI: {redirect_uri}")  # Debug log
+    print(f"[OAuth] Redirect URI: {redirect_uri}")
     
     return oauth.google.authorize_redirect(
         redirect_uri,
@@ -1095,6 +1390,10 @@ def google_callback():
             flash("Google account has no email.", "error")
             return redirect(url_for("signin"))
 
+        # ✅ Get phone from session
+        phone = session.get("pending_phone", "")
+        print(f"[Google Callback] Raw phone from session: '{phone}'")
+
         users_ref = db.collection("users").document(email)
         snap = users_ref.get()
 
@@ -1107,20 +1406,58 @@ def google_callback():
             print(f"[Google Callback] New user, assigned role: {role}")
 
         session.pop("pending_role", None)
+        session.pop("pending_phone", None)
 
         if role.lower() == "donor":
             role = "user"
 
-        users_ref.set({
+        # ✅ Prepare user data
+        user_data = {
             "email": email,
             "name": name,
             "picture": picture,
             "role": role,
             "last_login": datetime.utcnow().isoformat() + "Z"
-        }, merge=True)
+        }
+        
+        # ✅ NORMALIZE and save phone number
+        if phone:
+            # Remove all non-digit characters
+            clean_phone = ''.join(filter(str.isdigit, phone))
+            print(f"[Google Callback] Cleaned phone (digits only): '{clean_phone}' (length: {len(clean_phone)})")
+            
+            # Handle different formats
+            if len(clean_phone) == 12 and clean_phone.startswith('91'):
+                # Format: 919819029098 → +919819029098
+                normalized_phone = f"+{clean_phone}"
+                print(f"[Google Callback] Detected 12-digit with country code")
+            elif len(clean_phone) == 10:
+                # Format: 9819029098 → +919819029098
+                normalized_phone = f"+91{clean_phone}"
+                print(f"[Google Callback] Detected 10-digit number")
+            elif len(clean_phone) == 11 and clean_phone.startswith('0'):
+                # Format: 09819029098 → +919819029098
+                normalized_phone = f"+91{clean_phone[1:]}"
+                print(f"[Google Callback] Detected 11-digit with leading 0")
+            else:
+                # Invalid format - don't save
+                print(f"[Google Callback] Invalid phone format: '{phone}' (cleaned: '{clean_phone}', length: {len(clean_phone)})")
+                normalized_phone = None
+            
+            # Save normalized phone
+            if normalized_phone:
+                user_data["phone"] = normalized_phone
+                print(f"[Google Callback] Saving phone: {normalized_phone}")
+            else:
+                print(f"[Google Callback] Phone not saved due to invalid format")
+        else:
+            print(f"[Google Callback] No phone number provided")
 
+        # Save to Firestore
+        users_ref.set(user_data, merge=True)
         print(f"[Google Callback] User saved to Firestore")
 
+        # Set session
         session.permanent = True
         session["email"] = email
         session["username"] = name
@@ -1131,6 +1468,7 @@ def google_callback():
 
         flash("Signed in successfully ✔️", "success")
 
+        # Redirect based on role
         if role == "admin":
             print("[Google Callback] Redirecting to admin_home")
             return redirect(url_for("admin_home"))
@@ -1924,6 +2262,635 @@ def get_top_donors():
             "message": str(e),
             "top_donors": []
         }), 500
+
+@app.route("/test-sms-fast2sms")
+def test_sms_fast2sms():
+    """Test route to verify Fast2SMS works"""
+    if not app.debug and session.get("role") != "admin":
+        return "Test route disabled", 403
+    
+    # Test with your own number
+    test_phone = "8850134584"  # Replace with YOUR number (10 digits only)
+    test_message = "Test SMS from PlasmoBlood Sync! Your free Fast2SMS integration is working."
+    
+    success = send_sms_fast2sms_blocking(test_phone, test_message)
+    
+    if success:
+        return f"✅ SMS sent successfully to {test_phone}. Check your phone!"
+    else:
+        return f"❌ SMS failed. Check console logs for errors."
+
+@app.route("/r/<request_id>/<donor_id>")
+def donor_response_page(request_id, donor_id):
+    """
+    Mobile-friendly response page with Accept/Reject buttons
+    Shown when donor clicks SMS link
+    """
+    try:
+        # Fetch request details
+        request_ref = db.collection(get_request_collection()).document(request_id)
+        request_doc = request_ref.get()
+        
+        if not request_doc.exists:
+            return """
+            <html>
+            <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+                <h2>❌ Request Not Found</h2>
+                <p>This blood/plasma request may have been cancelled or already fulfilled.</p>
+            </body>
+            </html>
+            """, 404
+        
+        request_data = request_doc.to_dict()
+        
+        # Check if already responded
+        if request_data.get("status") in ["accepted", "rejected"]:
+            return """
+            <html>
+            <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+                <h2>⏱️ Already Responded</h2>
+                <p>This request has already been processed.</p>
+                <p>Thank you for your willingness to help!</p>
+            </body>
+            </html>
+            """
+        
+        # Fetch donor details
+        donor_ref = db.collection("users").document(donor_id)
+        donor_doc = donor_ref.get()
+        
+        if not donor_doc.exists:
+            return "<h2>❌ Donor not found</h2>", 404
+        
+        donor_data = donor_doc.to_dict()
+        
+        # Build accept/reject links
+        accept_link = url_for("donor_response", request_id=request_id, donor_id=donor_id, action="accept", _external=True)
+        reject_link = url_for("donor_response", request_id=request_id, donor_id=donor_id, action="reject", _external=True)
+        
+        # Mobile-friendly HTML with big buttons
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+            <title>Blood/Plasma Request</title>
+            <style>
+                * {{
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }}
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    padding: 20px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }}
+                .container {{
+                    background: white;
+                    border-radius: 16px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 500px;
+                    width: 100%;
+                    overflow: hidden;
+                }}
+                .header {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 30px 20px;
+                    text-align: center;
+                }}
+                .header h1 {{
+                    font-size: 24px;
+                    margin-bottom: 5px;
+                }}
+                .header p {{
+                    opacity: 0.9;
+                    font-size: 14px;
+                }}
+                .content {{
+                    padding: 30px 20px;
+                }}
+                .greeting {{
+                    font-size: 18px;
+                    margin-bottom: 20px;
+                    color: #333;
+                }}
+                .info-card {{
+                    background: #f8f9fa;
+                    border-left: 4px solid #667eea;
+                    padding: 20px;
+                    margin-bottom: 25px;
+                    border-radius: 8px;
+                }}
+                .info-row {{
+                    display: flex;
+                    margin-bottom: 12px;
+                    font-size: 15px;
+                }}
+                .info-row:last-child {{
+                    margin-bottom: 0;
+                }}
+                .info-label {{
+                    font-weight: bold;
+                    color: #667eea;
+                    min-width: 100px;
+                }}
+                .info-value {{
+                    color: #333;
+                }}
+                .buttons {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: 15px;
+                    margin-top: 25px;
+                }}
+                .btn {{
+                    display: block;
+                    padding: 18px;
+                    border-radius: 12px;
+                    text-decoration: none;
+                    font-weight: bold;
+                    font-size: 18px;
+                    text-align: center;
+                    transition: transform 0.2s, box-shadow 0.2s;
+                    border: none;
+                    cursor: pointer;
+                }}
+                .btn:active {{
+                    transform: scale(0.98);
+                }}
+                .btn-accept {{
+                    background: #28a745;
+                    color: white;
+                    box-shadow: 0 4px 15px rgba(40, 167, 69, 0.3);
+                }}
+                .btn-accept:hover {{
+                    background: #218838;
+                    box-shadow: 0 6px 20px rgba(40, 167, 69, 0.4);
+                }}
+                .btn-reject {{
+                    background: #dc3545;
+                    color: white;
+                    box-shadow: 0 4px 15px rgba(220, 53, 69, 0.3);
+                }}
+                .btn-reject:hover {{
+                    background: #c82333;
+                    box-shadow: 0 6px 20px rgba(220, 53, 69, 0.4);
+                }}
+                .footer {{
+                    padding: 20px;
+                    text-align: center;
+                    color: #666;
+                    font-size: 13px;
+                    border-top: 1px solid #eee;
+                }}
+                .urgent {{
+                    background: #fff3cd;
+                    border-left-color: #ffc107;
+                    padding: 15px;
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                    font-size: 14px;
+                    color: #856404;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🩸 Blood/Plasma Request</h1>
+                    <p>Someone needs your help!</p>
+                </div>
+                
+                <div class="content">
+                    <div class="greeting">
+                        Hi <strong>{donor_data.get('name', 'Donor')}</strong> 👋
+                    </div>
+                    
+                    <div class="urgent">
+                        ⏰ <strong>Urgent:</strong> Please respond quickly to help save a life
+                    </div>
+                    
+                    <div class="info-card">
+                        <div class="info-row">
+                            <span class="info-label">Patient:</span>
+                            <span class="info-value">{request_data.get('patient_name', 'N/A')}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Blood Group:</span>
+                            <span class="info-value">{request_data.get('blood_group', 'N/A')}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Contact:</span>
+                            <span class="info-value">{request_data.get('phone', 'See email')}</span>
+                        </div>
+                        {f'''<div class="info-row">
+                            <span class="info-label">Details:</span>
+                            <span class="info-value">{request_data.get('details')}</span>
+                        </div>''' if request_data.get('details') else ''}
+                    </div>
+                    
+                    <div class="buttons">
+                        <a href="{accept_link}" class="btn btn-accept">
+                            ✅ Accept - I Can Help
+                        </a>
+                        <a href="{reject_link}" class="btn btn-reject">
+                            ❌ Decline - Not Available
+                        </a>
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    © PlasmoBlood Sync - Saving lives, one donation at a time
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+        
+    except Exception as e:
+        print(f"❌ Error in donor_response_page: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return f"<h2>❌ Error: {str(e)}</h2>", 500 
+
+# ============================================
+# STANDALONE DONOR RESPONSE PAGE (for SMS)
+# ============================================
+
+# Replace these routes in your app.py
+# Also update this route to use url_for with the new endpoint name:
+@app.route("/respond/<request_id>/<donor_id>")
+def respond_page(request_id, donor_id):
+    """Standalone donor response page (NO LOGIN REQUIRED)"""
+    if not request_id or not donor_id:
+        return """
+        <html>
+        <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="font-family: Arial; text-align: center; padding: 50px; background: #f5f5f5;">
+            <h2>❌ Invalid Link</h2>
+            <p>This donation link is invalid or incomplete.</p>
+        </body>
+        </html>
+        """, 400
+    
+    return render_template("donor_response.html", 
+                         request_id=request_id, 
+                         donor_id=donor_id)
+
+@app.route("/api/get_request_data/<request_id>/<donor_id>")
+def api_get_request_data(request_id, donor_id):
+    """
+    Public API endpoint - NO LOGIN REQUIRED
+    Returns JSON (not HTML!)
+    """
+    try:
+        print(f"📡 API call: request={request_id}, donor={donor_id}")
+        
+        # Validate inputs
+        if not request_id or not donor_id:
+            return jsonify({
+                "status": "error",
+                "message": "Missing request ID or donor ID"
+            }), 400
+        
+        # Try both blood and plasma collections
+        request_doc = None
+        collection_used = None
+        
+        for collection_name in ["blood_requests", "plasma_requests"]:
+            try:
+                req_ref = db.collection(collection_name).document(request_id)
+                req_doc = req_ref.get()
+                
+                if req_doc.exists:
+                    request_doc = req_doc
+                    collection_used = collection_name
+                    print(f"✅ Found request in {collection_name}")
+                    break
+            except Exception as e:
+                print(f"⚠️ Error checking {collection_name}: {e}")
+                continue
+        
+        if not request_doc or not request_doc.exists:
+            print(f"❌ Request {request_id} not found in any collection")
+            return jsonify({
+                "status": "error",
+                "message": "Request not found"
+            }), 404
+        
+        request_data = request_doc.to_dict()
+        
+        # Check if already responded
+        current_status = request_data.get("status", "pending")
+        if current_status in ["accepted", "rejected"]:
+            print(f"⚠️ Request already {current_status}")
+            return jsonify({
+                "status": "error",
+                "message": "already_processed",
+                "detail": "This request has already been processed"
+            }), 400
+        
+        # Fetch donor
+        try:
+            donor_ref = db.collection("users").document(donor_id)
+            donor_doc = donor_ref.get()
+            
+            if not donor_doc.exists:
+                print(f"❌ Donor {donor_id} not found")
+                return jsonify({
+                    "status": "error",
+                    "message": "Donor not found"
+                }), 404
+            
+            donor_data = donor_doc.to_dict()
+            print(f"✅ Found donor: {donor_data.get('name')}")
+            
+        except Exception as e:
+            print(f"❌ Error fetching donor: {e}")
+            return jsonify({
+                "status": "error",
+                "message": "Error fetching donor data"
+            }), 500
+        
+        # Calculate distance
+        distance_str = "nearby"
+        try:
+            donor_lat = donor_data.get("lat")
+            donor_lng = donor_data.get("lng")
+            request_lat = request_data.get("lat")
+            request_lng = request_data.get("lng")
+            
+            if all([donor_lat, donor_lng, request_lat, request_lng]):
+                distance_km = geodesic(
+                    (request_lat, request_lng),
+                    (donor_lat, donor_lng)
+                ).km
+                distance_str = f"{distance_km:.1f} km"
+        except Exception as e:
+            print(f"⚠️ Distance calculation failed: {e}")
+        
+        # Build response (MUST be valid JSON!)
+        response_data = {
+            "status": "success",
+            "request": {
+                "id": request_id,
+                "patient_name": request_data.get("patient_name", "N/A"),
+                "blood_group": request_data.get("blood_group", "N/A"),
+                "details": request_data.get("details", ""),
+                "phone": request_data.get("phone", "N/A"),
+                "distance": distance_str
+            },
+            "donor": {
+                "id": donor_id,
+                "name": donor_data.get("name", "Donor"),
+                "email": donor_data.get("email", "")
+            }
+        }
+        
+        print(f"✅ Sending response: {response_data}")
+        return jsonify(response_data)
+        
+    except Exception as e:
+        print(f"❌ Unexpected error in api_get_request_data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": "Server error occurred"
+        }), 500
+
+
+@app.route("/donor_response/<request_id>/<donor_id>/<action>")
+def handle_donor_response(request_id, donor_id, action):  # ✅ Changed function name
+    """Handle donor accept/reject (NO LOGIN REQUIRED)"""
+    try:
+        print(f"🔔 Donor response: {action} from {donor_id} for {request_id}")
+        
+        # Validate action
+        if action not in ["accept", "reject"]:
+            return """
+            <html>
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family: Arial; text-align: center; padding: 50px;">
+                <h2>❌ Invalid Action</h2>
+                <p>Action must be 'accept' or 'reject'</p>
+            </body>
+            </html>
+            """, 400
+        
+        # Find request in both collections
+        request_ref = None
+        request_doc = None
+        
+        for collection_name in ["blood_requests", "plasma_requests"]:
+            req_ref = db.collection(collection_name).document(request_id)
+            req_doc = req_ref.get()
+            
+            if req_doc.exists:
+                request_ref = req_ref
+                request_doc = req_doc
+                break
+
+        if not request_doc or not request_doc.exists:
+            return """
+            <html>
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: Arial; text-align: center; padding: 50px; background: #f5f5f5; }
+                .error { background: white; padding: 40px; border-radius: 12px; max-width: 500px; margin: 0 auto; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+                .icon { font-size: 64px; margin-bottom: 20px; }
+            </style>
+            </head>
+            <body>
+                <div class="error">
+                    <div class="icon">❌</div>
+                    <h2>Request Not Found</h2>
+                    <p>This donation request may have been cancelled.</p>
+                </div>
+            </body>
+            </html>
+            """, 404
+
+        request_data = request_doc.to_dict()
+        
+        # Check if already processed
+        if request_data.get("status") in ["accepted", "rejected"]:
+            return """
+            <html>
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: Arial; text-align: center; padding: 50px; background: linear-gradient(135deg, #f59e0b 0%, #f97316 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+                .info { background: white; padding: 40px; border-radius: 16px; max-width: 500px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+                .icon { font-size: 72px; margin-bottom: 20px; }
+            </style>
+            </head>
+            <body>
+                <div class="info">
+                    <div class="icon">⏱️</div>
+                    <h2>Already Processed</h2>
+                    <p style="font-size: 16px;">This request has already been handled.</p>
+                    <p>Thank you for your willingness to help!</p>
+                </div>
+            </body>
+            </html>
+            """, 200
+
+        # Fetch donor
+        donor_ref = db.collection("users").document(donor_id)
+        donor_doc = donor_ref.get()
+
+        if not donor_doc.exists:
+            return """
+            <html>
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family: Arial; text-align: center; padding: 50px;">
+                <h2>❌ Donor Not Found</h2>
+            </body>
+            </html>
+            """, 404
+
+        donor_data = donor_doc.to_dict()
+        patient_email = request_data.get("email") or SENDGRID_FROM_EMAIL
+        
+        FEEDBACK_URL = "https://docs.google.com/forms/d/e/1FAIpQLSfiyiQmI3xUZc1zHrUGHJQsYOVB_JGAox4mDMnDYUHA2xxZYQ/viewform"
+
+        if action == "accept":
+            # Update request
+            request_ref.update({
+                "status": "accepted",
+                "accepted_by": donor_id,
+                "accepted_donor": {
+                    "id": donor_id,
+                    "name": donor_data.get("name"),
+                    "email": donor_data.get("email"),
+                    "phone": donor_data.get("phone"),
+                    "blood_group": donor_data.get("blood_group", "Unknown")
+                },
+                "accepted_at": datetime.utcnow()
+            })
+            print(f"✅ Request accepted by {donor_data.get('name')}")
+
+            # Send emails (threaded)
+            donor_html = f"""
+            <html>
+            <body style="font-family: Arial; line-height: 1.6;">
+                <div style="max-width: 600px; margin: 0 auto;">
+                    <div style="background: #10b981; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0;">
+                        <h2>✅ Thank You!</h2>
+                    </div>
+                    <div style="background: #f9f9f9; padding: 20px;">
+                        <p>Hi <strong>{donor_data.get('name')}</strong>,</p>
+                        <p>Your response has been recorded. The patient has been notified.</p>
+                        <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid #10b981;">
+                            <div><strong>Patient:</strong> {request_data.get('patient_name')}</div>
+                            <div><strong>Blood Group:</strong> {request_data.get('blood_group')}</div>
+                            <div><strong>Contact:</strong> {request_data.get('phone', 'N/A')}</div>
+                        </div>
+                        <p>Please coordinate with the patient. Your help saves lives! ❤️</p>
+                        <div style="text-align: center; margin-top: 20px;">
+                            <a href="{FEEDBACK_URL}" style="background: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">📝 Give Feedback</a>
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            send_email_threaded(donor_data["email"], "✅ Donation Confirmed", donor_html)
+
+            notify_html = f"""
+            <html>
+            <body style="font-family: Arial;">
+                <div style="max-width: 600px; margin: 0 auto;">
+                    <div style="background: #10b981; color: white; padding: 20px; text-align: center;">
+                        <h2>🎉 Donor Found!</h2>
+                    </div>
+                    <div style="background: #f9f9f9; padding: 20px;">
+                        <p>A donor has accepted your request!</p>
+                        <div style="background: white; padding: 15px; border-left: 4px solid #10b981;">
+                            <div><strong>Name:</strong> {donor_data.get('name', 'N/A')}</div>
+                            <div><strong>Phone:</strong> {donor_data.get('phone', 'N/A')}</div>
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            send_email_threaded(patient_email, f"🩸 Donor Found: {donor_data.get('name')}", notify_html)
+
+            return f"""
+            <html>
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: Arial; text-align: center; padding: 20px; background: linear-gradient(135deg, #10b981 0%, #059669 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+                .success {{ background: white; padding: 40px; border-radius: 16px; max-width: 500px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }}
+                .icon {{ font-size: 72px; margin-bottom: 20px; }}
+                .btn {{ display: inline-block; margin-top: 20px; background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; }}
+            </style>
+            </head>
+            <body>
+                <div class="success">
+                    <div class="icon">✅</div>
+                    <h1 style="color: #10b981;">Thank You!</h1>
+                    <p style="font-size: 18px;">You've accepted the donation request.</p>
+                    <p>A confirmation email has been sent.</p>
+                    <a href="{FEEDBACK_URL}" class="btn">📝 Give Feedback</a>
+                </div>
+            </body>
+            </html>
+            """
+
+        elif action == "reject":
+            request_ref.update({
+                "status": "rejected",
+                "rejected_by": donor_id,
+                "rejected_at": datetime.utcnow()
+            })
+            print(f"❌ Request rejected by {donor_data.get('name')}")
+            
+            return """
+            <html>
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: Arial; text-align: center; padding: 20px; background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+                .info { background: white; padding: 40px; border-radius: 16px; max-width: 500px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+                .icon { font-size: 72px; margin-bottom: 20px; }
+            </style>
+            </head>
+            <body>
+                <div class="info">
+                    <div class="icon">❌</div>
+                    <h1 style="color: #6b7280;">Request Declined</h1>
+                    <p style="font-size: 18px;">You've declined this donation request.</p>
+                    <p>We'll notify other available donors.</p>
+                </div>
+            </body>
+            </html>
+            """
+
+    except Exception as e:
+        print(f"❌ Error in handle_donor_response: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return f"""
+        <html>
+        <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="font-family: Arial; text-align: center; padding: 50px;">
+            <h2>❌ Error Occurred</h2>
+            <p>Please try again or contact support.</p>
+        </body>
+        </html>
+        """, 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
